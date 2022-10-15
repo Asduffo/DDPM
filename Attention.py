@@ -5,15 +5,21 @@ Created on Fri Sep 23 16:55:59 2022
 @author: Admin
 """
 
+###############################################################################
+#FOR THE RECORDS: L = total number of pixels in the image (rows*columns)
+###############################################################################
+
 import torch
 import math
 import numpy as np
+import einops
 
+#abstract Attention class
 class Attention(torch.nn.Module):
     def __init__(self,
-                 device           = 'cuda',
-                 d_model    : int = 512,
-                 h          : int = 8,
+                 device        = 'cuda',
+                 d_model : int = 128,   #h*(heads dimention).
+                 h       : int = 4,     #number of heads
                  ):
         super(Attention, self).__init__()
         
@@ -21,22 +27,20 @@ class Attention(torch.nn.Module):
         self.d_model = d_model
         self.h       = h
         
+        #d_model must be a multiple of h
         assert(self.d_model % self.h == 0), "MultiHeadAttention: self.d_model % self.h != 0"
         self.head_dim = self.d_model // self.h
-        
-    #switches from [b, L, d_model = d_k*h] to [b, h, L, d_k]
-    def transpose_heads(self, x):
-        new_x_shape = x.size()[:-1] + (self.h, self.head_dim)
-        x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)
-        
+    
     """
-    Quick reminder that here Q, K and V have already been multiplied by a linear matrix
-    They have size [b, L, d_model]
+    Quick reminder that here Q, K and V have already been through a conv2d
+    They have size [b, h, L, head_dim = d_k] where L = total number of pixels in the image
     """
     def forward(self, Q, K, V, mask = None):
         pass
     
+"""
+Standard Scale Dot Product attention
+"""
 class SDPAttention(Attention):
     def __init__(self,
                  device             = 'cuda',
@@ -53,12 +57,10 @@ class SDPAttention(Attention):
         self.dropout = torch.nn.Dropout(p = dropout_p)
     
     def forward(self, Q, K, V, mask = None):
-        #useful below
-        batch_size = Q.size(0)
-        
         #[b, h, L, L]
         prod = torch.matmul(Q, K.permute(0, 1, 3, 2)) / self.d_k_sqrt
         
+        #unused in the final code
         if mask is not None:
             prod = prod.masked_fill(mask == 0, -1e10)
             
@@ -69,179 +71,178 @@ class SDPAttention(Attention):
         #[b, h, L, d_v]
         res = torch.matmul(self.dropout(att), V)
         
-        #[b, L, h, d_v]
-        # res = res.permute(0, 2, 1, 3).contiguous()
-        
-        #[b, L, h*d_v = d_model]
-        # res = res.view(batch_size, -1, self.d_model)
-        
         return res, att
     
-class FLAVORplus(Attention):
+"""
+Performers code (also known as FAVOR+)
+"""
+class FAVORplus(Attention):
     def __init__(self,
-                 device                       = 'cuda',
-                 d_model              : int   = 512,
-                 h                    : int   = 4,            #number of head
-                 kernel_type          : str   = 'FLAVOR_SDP', #FLAVOR_SDP or FLAVOR_RELU supported
-                 numerical_stabilizer : float = .0001,        #used in cases such as relu giving us a whole row equal to 0
-                 redraw_steps         : int   = 1000,         #redraw after how many steps?
-                 m                    : int   = 64,           #number of random ortohogonal features
-                 renormalize          : bool  = False
+                 device                 = 'cuda',
+                 d_model        : int   = 512,
+                 h              : int   = 4,            #number of head
+                 kernel_type    : str   = 'FAVOR_SDP',  #FAVOR_SDP or FAVOR_RELU supported
+                 num_stabilizer : float = .0001,        #used in cases such as relu giving us a whole row equal to 0
+                 redraw_steps   : int   = 1000,         #redraw after how many steps?
+                 m              : int   = None,         #number of random ortohogonal features
                  ):
-        super(FLAVORplus, self).__init__(device,
-                                         d_model,
-                                         h)
+        super(FAVORplus, self).__init__(device,
+                                        d_model,
+                                        h)
         
-        self.f = [] 
-        self.g = None #h in the paper
-        self.m = m
+        self.device         = device
+        self.d_model        = d_model
+        self.h              = h
+        self.kernel_type    = kernel_type
+        self.num_stabilizer = num_stabilizer
+        self.redraw_steps   = redraw_steps
         
-        
-        self.kernel_type          = kernel_type
-        self.numerical_stabilizer = numerical_stabilizer
-        self.redraw_steps         = redraw_steps
-        self.curr_redraw_step     = 0
-        self.renormalize          = renormalize
-        
-        self.w = self.redraw_w()
-        
-        self.f = []
-        self.f_count = 2
-        if(self.kernel_type == 'FLAVOR_SDP'):
-            self.f_count = 2
-            self.f.append(torch.exp)
-            self.f.append(torch.exp)
-        else: #default is RELU
-            self.f_count = 1
-            self.f.append(torch.nn.ReLU())
-    
-    def redraw_w(self):
-        #it is easy to create it with numpy
-        H = np.random.rand(self.h, self.head_dim, self.m)
-        
-        #orthogonalizes the heads
-        for i in range(self.h):
-            u, s, vh = np.linalg.svd(H[i,:,:], full_matrices=False)
-            H[i,:,:] = u @ vh
-        
-        #converts to torch tensor
-        w = torch.from_numpy(H).to(self.device)
-        w.double()
-        w.require_grad = False
-        
-        return w
-    
-    #This is the real complicated part: given M of size [b, h, L, head_size], performs
-    #a random feature map into its rows
-    def phi(self, M : torch.Tensor):
-        #multiplies the matrix by the orthogonal features
-        #final size = [b, h, L, m]
-        #CORRECT
-        o = M.double() @ self.w
-        
-        #creates an array of tensors where each one is the o tensor mapped to a certain function
-        mapped_blocks = []
-        if(self.kernel_type == 'FLAVOR_SDP'):
-            mapped_blocks.append(self.f[0](o))
-            mapped_blocks.append(self.f[1](-o))
+        if(m is not None): 
+            self.m = m
         else:
-            mapped_blocks.append(self.f[0](o))
+            #m = d*log(d) is the optimal m size in terms of kernel approx.
+            self.m = self.head_sz*math.ceil(math.log(self.head_sz))
         
-        #concatenates the various blocks by columns. Final size: [b, h, L, m*self.f_count]
-        #CORRECT
-        big_o = mapped_blocks[0]
-        for i in range(1, self.f_count):
-            # dim = -1 means to concatenate by the columns of the last axis
-            big_o = torch.cat((big_o, mapped_blocks[i]), dim = -1)
+        #useful in softmax_kernel
+        self.sq_d    = torch.sqrt(torch.tensor([self.head_sz], dtype=torch.float32)).to(self.device)
+        self.sq_sq_d = torch.sqrt(self.sq_d).to(self.device)
+        self.sq_m    = torch.sqrt(torch.tensor([self.m], dtype=torch.float32)).to(self.device)
         
-        big_o = big_o + self.numerical_stabilizer
+        self.projection_matrix = self.redraw_proj_matrix()
+        self.n_calls = 0
         
-        #DEBUG
-        # [b, h, L, m*self.f_count]
-        # big_o = torch.randn((2, 3, 4, 5))
+    #returns a [m, head_sz] matrix where each sub-blocks of
+    #rows of size <head_size> are orthogonal between each other.
+    def redraw_proj_matrix(self):
+        n_subblocks = int(self.m / self.head_sz)
         
-        M_size = M.size()
-        M_b = M_size[0]
-        M_h = M_size[1]
-        M_L = M_size[2]
+        #it is easier to store the subblocks in an array and then just use cat
+        subblocks = []
         
-        # torch.autograd.set_detect_anomaly(True)
-        
-        #creates a column tensor of L elements where row i contains g(M[i-th row])
-        g_vector = torch.ones((M_b, M_h, M_L, 1)).to(self.device)
-        
-        
-        if(self.kernel_type == 'FLAVOR_SDP'):
-            g_vector  = torch.norm(M, p = 2, dim = -1, keepdim = True) #norm
-            g_vector  = -torch.square(g_vector)/2                      #squared norm, divide by -1/2
-            g_vector  = torch.exp(g_vector)/math.sqrt(2)               #exponent, divide by 2
-        #the else is (at the moment) useless since the other implemented kernel is RELU and g is the identity function
-        #NB: dividing by sqrt(m) is done below
-        
-        # print(g_vector.size())
-        
-        #multiplies each row (meaning, penultimate axis) in the big_o tensor by
-        #the corresponding element in g, hadamard style.
-        #CORRECT (or so it seems)
-        big_o = (big_o * g_vector) / math.sqrt(self.m)
-        
-        #unfortunately looks like there are no functions which allows for mapping
-        #each row of each batch to a certain 
-        return big_o
-    
-    def forward(self, Q, K, V, mask = None):
-        #they are all expected to be of size [batch_size, h, L, head_size]
-        #NB: r = m*self.f_count
-        
-        self.curr_redraw_step += 1
-        if(self.curr_redraw_step % self.redraw_steps == 0):
-            self.w = self.redraw_w()
+        for i in range(n_subblocks):
+            #creates a [head_sz, head_sz] subblock of the random ortohogonal features
+            start_matrix = torch.randn((self.head_sz, self.head_sz))
+            q, _ = torch.linalg.qr(start_matrix) #it's already in mode "thin qr" 
             
-        #new size: [b, h, L, r]
-        Q_p = self.phi(Q).float()
-        K_p = self.phi(K).float()
+            #transposes q
+            q = q.permute((1, 0)).to(self.device)
+            
+            subblocks.append(q)
+            
+        remaining_rows = self.m - n_subblocks*self.d_model
+        if(remaining_rows != 0):
+            #creates a [head_sz, head_sz] subblock of the random ortohogonal features
+            start_matrix = torch.randn((self.head_sz, self.head_sz))
+            q, _ = torch.linalg.qr(start_matrix) #it's already in mode "thin qr" 
+            
+            #transposes q
+            q = q.permute((1, 0)).to(self.device)
+            
+            subblocks.append(q[:remaining_rows, :])
         
+        #stacks them vertically
+        to_return = torch.cat(subblocks)
         
-        #we get V's shape and set the last dimension (the columns) to 1, which is
-        #the shape of 1L => in theory it should be of size [b, h, L, 1]
-        oneL_size = list(V.size())
-        oneL_size[-1] = 1
-        ones = torch.ones(oneL_size).to(self.device)
+        return to_return
+
+    #x size: [b, L, h, head_size] (converted by the forward method)
+    def softmax_kernel(self, x):
+        #x/d**(0.25)
+        arr = x/self.sq_sq_d
         
-        #size = [b, h, L, d_v + 1]
-        C = torch.cat((V, ones), dim = -1)
+        #altough projection_matrix^T has size [head_sz, m] and arr is 
+        #[b, L, h, head_sz], the multiplication automatically duplicates the
+        #projection matrix into 2 new axis before proceeding.
+        arr = arr @ self.projection_matrix.permute((1, 0)) #size: [b,L,h,m]
         
-        Buf2 = None
+        #(||x||^2)/(2*sqrt(head_sz))
+        #final size: [b, L, h, 1]
+        g = x**2
+        g = torch.sum(g, dim = -1, keepdim = True)
+        g = g/(2*self.sq_d)
         
-        #K_p.permute((-1, -2)) transposes the last two axis
-        #size: [b, h, r, (d_v + 1)]
-        Buf1 = K_p.permute((0, 1, 3, 2)) @ C
+        #since both g and arr's single members are exponentials, and we are
+        #supposed to multiply them, we can just sum them inside the exponent)
+        to_return = torch.exp(arr - g + self.num_stabilizer)/self.sq_m
         
-        #size: [b, h, L, (d_v + 1)]
-        Buf2 = Q_p @ Buf1
+        #final size: [b, L, h, m]
+        return to_return
+    
+    def relu_kernel(self, x):
+        #altough projection_matrix^T has size [head_sz, m] and arr is 
+        #[b, L, h, head_sz], the multiplication automatically duplicates the
+        #projection matrix into 2 new axis before proceeding.
+        arr = x @ self.projection_matrix.permute((1, 0)) #size: [b,L,h,m]
+        arr = arr/self.sq_m
+        arr = torch.nn.functional.relu(arr) + torch.tensor([self.num_stabilizer]).to(self.device)
+    
+        return arr
+    
+    #q,k and v size: [b, h, L, head_size]
+    #they are already multiplied by W_q etc
+    def forward(self, q, k, v):
+        if(self.n_calls > self.redraw_steps):
+            self.n_calls = 0
+            self.projection_matrix = self.redraw_proj_matrix()
+        self.n_calls += 1
         
+        q1 = einops.rearrange(q, 'b h L d -> b L h d')
+        k1 = einops.rearrange(k, 'b h L d -> b L h d')
         
-        Buf3 = Buf2[:, :, :,  :-1]  #Buf2 except for the last column              => [b, h, L, d_v]
-        buf4 = Buf2[:, :, :, [-1]]  #Buf2 last column. The [] preserves the shape => [b, h, L,   1]
-        
-        #buf3 size = [b, h, L, d_v]
-        #buf4 size = [b, h, L, 1]
-        #=> each column in buf4 should be used for the diagonal matrices that the paper calls D
-        #=> in theory, D has size [b, h, L, L] where the last 2 axis are all diagonal matrices.
-        #BUT we can just multiply the columns of the last 2 axis in hadamard style
-        #against the column in buf4. This saves complexity since it goes from O(L^2 * d) to O(Ld)
-        
-        #it multiplies (hadamard style) the columns of the last 2 axis of Buf3 by the
-        #column vector in the last 2 axis of buf4
-        #final size: [b, h, L, d_v]
-        
-        #the paper says that they have also tested the model without renormalization.
-        #normalization is prohibited in ReLU, since if one whole row in Q or K is zero,
-        #we end up with zeros on buf4 as well and 1/buf4 is not valid here.
-        if(self.renormalize):
-            #same shape as buf4 but each element has numerator and denominator inverted.
-            to_return = 1/buf4 * Buf3
+        #final size: [b, L, h, r] (r = m in softmax and relu)
+        if(self.kernel_type == 'FAVOR_RELU'):
+            phi_q = self.relu_kernel(q1)
+            phi_k = self.relu_kernel(k1)
         else:
-            to_return = Buf3
+            phi_q = self.softmax_kernel(q1)
+            phi_k = self.softmax_kernel(k1)
         
+        
+        #we now need to calculate D = diag(Q'(K'^T * 1L))
+        
+        #K'^T * 1L effectively deletes the "L" dimention => to do the same
+        #with attention heads and batches, we need to bring the L axis on
+        #the extreme left => [L, b, h, r]
+        phi_q = einops.rearrange(phi_q, 'b L h r -> L b h r')
+        phi_k = einops.rearrange(phi_k, 'b L h r -> L b h r')
+        
+        #k'^T * 1L is effectively the sum of the [b, h, r] sub-blocks
+        #(hence, along axis 0)
+        #resulting size: [b, h, r]
+        phi_k_sum = torch.sum(phi_k, dim = 0)
+        
+        #Q'(phi_k_sum) is slightly trickier because of how the axis order but
+        #it comes down to:
+        #1) make an hadamard product between each axis 0 slice of phi_q against phi_k_sum
+        #2) sum the columns (last axis) of the result of operation (1)
+        #final size: [L, b, h]
+        D = phi_q * phi_k_sum
+        D = torch.sum(D, dim = -1)
+        
+        #sets back D to the "proper" axis order where batch is first
+        D = einops.rearrange(D, 'L b h -> b L h')
+        
+        #reshapes as [b, L, h, 1].
+        #this has the advantage that if A has shape [b, L, h, d], if we perform
+        #A/D we are effectively dividing each row of a single slice [i, j,k,:] of A
+        #against the correct normalizer [i, j, k]
+        D = torch.unsqueeze(D, -1)
+        
+        
+        #now for the attention matrix
+        #A = (d^-1)(Q'((K'^T)V))
+        
+        #we reshape V to be compatible with q'
+        v1 = einops.rearrange(v, 'b h L d -> L b h d')
+        
+        A = phi_k.permute((0, 1, 3, 2)) @ v1 #[L,b,r,h]x[L,b,h,d] = [L,b,r,d]
+        A = phi_q @ A                        #[L,b,h,r]x[L,b,r,d] = [L,b,h,d]
+           
+        #sets back to the "proper" shape [b, L, h, d]
+        A = einops.rearrange(A, 'L b h d -> b L h d')
+        
+        #[b,h,L,d]/[b, L, h, 1] = [b,h,L,d]
+        to_return = A / D
+        
+        to_return = einops.rearrange(to_return, 'b L h d -> b h L d')
         return to_return, None

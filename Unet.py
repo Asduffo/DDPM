@@ -34,6 +34,7 @@ def Upsample(dim, dim_out = None):
 def Downsample(dim, dim_out = None):
     return torch.nn.Conv2d(dim, default(dim_out, dim), 4, 2, 1)
 
+#block composing the resnet
 class Block(torch.nn.Module):
     def __init__(self, dim, dim_out, groups = 8):
         super().__init__()
@@ -52,13 +53,14 @@ class Block(torch.nn.Module):
         x = self.act(x)
         return x
 
+#classic sinusoidal positional embeddings
 class SinusoidalPosEmb(torch.nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
 
-    #input: [batch_size, 1] > [batch_size, dim] (the rest of the 
-    #sinusoidal NN turns it into [batch_size, time_dim])
+    #input: [batch_size, 1]
+    #output:[batch_size, dim] (the rest of the sinusoidal NN turns it into [batch_size, time_dim])
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
@@ -68,6 +70,7 @@ class SinusoidalPosEmb(torch.nn.Module):
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
+#a single resnet block.
 class ResnetBlock(torch.nn.Module):
     def __init__(self, dim, dim_out, *, time_emb_dim = None, groups = 8):
         super().__init__()
@@ -78,14 +81,12 @@ class ResnetBlock(torch.nn.Module):
             torch.nn.Linear(time_emb_dim, dim_out * 2)
         ) if exists(time_emb_dim) else None
 
-        
         self.block1 = Block(dim, dim_out, groups = groups)
         self.block2 = Block(dim_out, dim_out, groups = groups)
         self.res_conv = torch.nn.Conv2d(dim, dim_out, 1) if dim != dim_out else torch.nn.Identity()
 
     def forward(self, x, time_emb = None):
         #x has size [b, layer_channels, layer_dim, layer_dim]
-        #
         scale_shift = None
         
         #time_emb size = [batch_size, time_emb_dim]
@@ -105,6 +106,7 @@ class ResnetBlock(torch.nn.Module):
 
         return h + self.res_conv(x)
     
+#given f and x, calculates f(x) + x
 class Residual(torch.nn.Module):
     def __init__(self, fn):
         super().__init__()
@@ -113,6 +115,7 @@ class Residual(torch.nn.Module):
     def forward(self, x, *args, **kwargs):
         return self.fn(x, *args, **kwargs) + x
     
+#given a function, applies group norm to x before doing f(x)
 class PreNorm(torch.nn.Module):
     def __init__(self, dim, fn):
         super().__init__()
@@ -123,20 +126,23 @@ class PreNorm(torch.nn.Module):
         x = self.norm(x)
         return self.fn(x)
     
+#the unet itself
 class Unet(torch.nn.Module):
     def __init__(
         self,
-        dim,                #initial number of channels for the image
-        dim_mults           = (1, 2, 4, 8),
-        channels            = 3,
+        dim,                                #initial number of channels for the image
+        dim_mults           = (1, 2, 4, 8), #see dims initialization for further infos.
+        channels            = 3,            #image original channels
         resnet_block_groups = 8,            #groups in the group norm
-        time_dim            = 256,
+        time_dim            = 256,          #time embeddings dimensionality
         
         h            : str  = 4,            #attention heads
-        att_type     : str  = 'FLAVOR_SDP',
-        m            : int  = 64,
-        redraw_steps : int  = 1000,
-        device              = 'cuda'
+        att_type     : str  = 'FAVOR_SDP',  #'SDP', 'FAVOR_SDP' or 'FAVOR_RELU'
+        m            : int  = None,         #number of random orthogonal features in case of FAVOR+
+        redraw_steps : int  = 1000,         #after how many steps we should redraw the random features
+        device              = 'cuda',
+        
+        use_original : bool = False         #if True, use the original attention code instead of the one in Attention.py
     ):
         super().__init__()
 
@@ -195,8 +201,8 @@ class Unet(torch.nn.Module):
             self.downs.append(torch.nn.ModuleList([
                 block_klass(dim_in, dim_in, time_emb_dim = self.time_dim),
                 block_klass(dim_in, dim_in, time_emb_dim = self.time_dim),
-                Residual(PreNorm(dim_in,
-                                 MultiHeadAttention(device, dim_in, 32*h, h, False, att_type, m, redraw_steps))),
+                Residual(PreNorm(dim_in, 
+                                 LinearAttention(dim_in) if use_original else MultiHeadAttention(device, dim_in, 32*h, h, False, att_type, m, redraw_steps))),
                 Downsample(dim_in, dim_out) if not is_last else torch.nn.Conv2d(dim_in, dim_out, 3, padding = 1)
             ]))
         
@@ -206,7 +212,7 @@ class Unet(torch.nn.Module):
         #the compressor is made by a series block > attention > block
         self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = self.time_dim)
         self.mid_attn = Residual(PreNorm(mid_dim,
-                                         MultiHeadAttention(device, mid_dim, 32*h, h, False, 'SDP', m, redraw_steps)))
+                                         Attention(mid_dim) if use_original else MultiHeadAttention(device, mid_dim, 32*h, h, False, 'SDP', m, redraw_steps)))
         #Attention(mid_dim)
         self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = self.time_dim)
 
@@ -218,7 +224,7 @@ class Unet(torch.nn.Module):
                 block_klass(dim_out + dim_in, dim_out, time_emb_dim = self.time_dim),
                 block_klass(dim_out + dim_in, dim_out, time_emb_dim = self.time_dim),
                 Residual(PreNorm(dim_out, 
-                                 MultiHeadAttention(device, dim_out, 32*h, h, False, att_type, m, redraw_steps))),
+                                 LinearAttention(dim_out) if use_original else MultiHeadAttention(device, dim_out, 32*h, h, False, att_type, m, redraw_steps))),
                 Upsample(dim_out, dim_in) if not is_last else  torch.nn.Conv2d(dim_out, dim_in, 3, padding = 1)
             ]))
 
