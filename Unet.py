@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Mon Sep 26 09:54:05 2022
 
-@author: Admin
-"""
 
 from inspect import isfunction
 from functools import partial
@@ -130,19 +126,22 @@ class PreNorm(torch.nn.Module):
 class Unet(torch.nn.Module):
     def __init__(
         self,
-        dim,                                #initial number of channels for the image
+        x_sz,                               #x/y size of the image
+        init_dim     : int  = None,         #if not None, the initial Conv2d operation will convert the input to have x_sz channels. else, init_dim will be used.
         dim_mults           = (1, 2, 4, 8), #see dims initialization for further infos.
         channels            = 3,            #image original channels
         resnet_block_groups = 8,            #groups in the group norm
         time_dim            = 256,          #time embeddings dimensionality
         
-        h            : str  = 4,            #attention heads
+        h            : int  = 4,            #attention heads
+        head_sz      : int  = 32,           #head size
+        
         att_type     : str  = 'FAVOR_SDP',  #'SDP', 'FAVOR_SDP' or 'FAVOR_RELU'
         m            : int  = None,         #number of random orthogonal features in case of FAVOR+
         redraw_steps : int  = 1000,         #after how many steps we should redraw the random features
         device              = 'cuda',
         
-        use_original : bool = False         #if True, use the original attention code instead of the one in Attention.py
+        use_original : bool = False,        #if True, use the original attention code instead of the one in Attention.py
     ):
         super().__init__()
 
@@ -152,15 +151,20 @@ class Unet(torch.nn.Module):
         #number of channels obtained by the first convolution
         input_channels = channels
 
-        #init_dim = dim
-        init_dim = dim
+        if(init_dim is None):
+            init_dim = x_sz
+            
+        L = x_sz*x_sz
+        
+        if(m is None):
+            m = head_sz*math.ceil(math.log(head_sz))
         
         #initial convolution. Returns a convolution with <init_dim> channels
         self.init_conv = torch.nn.Conv2d(input_channels, init_dim, 7, padding = 3)
 
-        #if(for example) dim_mults = (1, 2, 4, 8), dim = 32 and init_dim = 20, 
-        #then dims = [20, 32, 64, 128, 256] = [20, dim*1, dim*2, dim*4, dim*8]
-        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
+        #if(for example) dim_mults = (1, 2, 4, 8), init_dim = 32
+        #then dims = [20, 32, 64, 128, 256] = [20, x_sz*1, x_sz*2, x_sz*4, x_sz*8]
+        dims = [init_dim, *map(lambda m: init_dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
         block_klass = partial(ResnetBlock, groups = resnet_block_groups)
@@ -175,10 +179,10 @@ class Unet(torch.nn.Module):
         #to turn them into time_dim.
         self.time_mlp = torch.nn.Sequential(
             #[batch_sz, 1] => [batch_sz, dim]
-            SinusoidalPosEmb(dim),
+            SinusoidalPosEmb(init_dim),
             
             #[batch_sz, dim] => [batch_sz, time_dim]
-            torch.torch.nn.Linear(dim, self.time_dim),
+            torch.torch.nn.Linear(init_dim, self.time_dim),
             
             #[batch_sz, time_dim] => [batch_sz, time_dim]
             torch.torch.nn.GELU(),
@@ -192,27 +196,53 @@ class Unet(torch.nn.Module):
         self.ups = torch.nn.ModuleList([])    #decompressor
         num_resolutions = len(in_out)   #number of layers
 
+        curr_L = L
         #creates <num_resolutions> layers for the compressor
         for ind, (dim_in, dim_out) in enumerate(in_out):
             #checks if it's the last layer
             is_last = ind == (num_resolutions - 1)
             
+            curr_m = m
+            if(m > curr_L and not use_original):
+                curr_m = int(curr_L)
+                if(curr_m < 1 ) : curr_m = 1
+                print("curr_m modified to ", curr_m, " (curr_L = ", curr_L, ", optimal m = ", m, ")")
+            
+            
             #the stuff inside this ModuleList is all a single  layer's content
             self.downs.append(torch.nn.ModuleList([
                 block_klass(dim_in, dim_in, time_emb_dim = self.time_dim),
                 block_klass(dim_in, dim_in, time_emb_dim = self.time_dim),
-                Residual(PreNorm(dim_in, 
-                                 LinearAttention(dim_in) if use_original else MultiHeadAttention(device, dim_in, 32*h, h, False, att_type, m, redraw_steps))),
+                Residual(PreNorm(dim_in, LinearAttention(dim_in, 
+                                                         heads = h,
+                                                         dim_head = head_sz) if use_original else MultiHeadAttention(device = device, 
+                                                                                                                     dim = dim_in, 
+                                                                                                                     d_model = head_sz*h,
+                                                                                                                     h = h, 
+                                                                                                                     bias = False, 
+                                                                                                                     att_type = att_type, 
+                                                                                                                     m = curr_m, 
+                                                                                                                     redraw_steps = redraw_steps))),
+                                                                                                                     
                 Downsample(dim_in, dim_out) if not is_last else torch.nn.Conv2d(dim_in, dim_out, 3, padding = 1)
             ]))
+            
+            curr_L /= 4
         
+        curr_L *= 4
         #mid_dim = size of the compressor's last output
         mid_dim = dims[-1]
         
         #the compressor is made by a series block > attention > block
         self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = self.time_dim)
-        self.mid_attn = Residual(PreNorm(mid_dim,
-                                         Attention(mid_dim) if use_original else MultiHeadAttention(device, mid_dim, 32*h, h, False, 'SDP', m, redraw_steps)))
+        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim, 
+                                                            heads = h, 
+                                                            dim_head = head_sz) if use_original else MultiHeadAttention(device = device, 
+                                                                                                                        dim = mid_dim, 
+                                                                                                                        d_model = head_sz*h,
+                                                                                                                        h = h, 
+                                                                                                                        bias = False, 
+                                                                                                                        att_type = 'SDP')))
         #Attention(mid_dim)
         self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = self.time_dim)
 
@@ -220,19 +250,35 @@ class Unet(torch.nn.Module):
             #is this the bottomest layer? (happens at the last iteration)
             is_last = ind == (num_resolutions - 1)
 
+            curr_m = m
+            if(m > curr_L and not use_original):
+                curr_m = int(curr_L)
+                if(curr_m < 1 ) : curr_m = 1
+                print("curr_m modified to ", curr_m, " (curr_L = ", curr_L, ", optimal m = ", m, ")")
+                
+                
             self.ups.append(torch.nn.ModuleList([
                 block_klass(dim_out + dim_in, dim_out, time_emb_dim = self.time_dim),
                 block_klass(dim_out + dim_in, dim_out, time_emb_dim = self.time_dim),
-                Residual(PreNorm(dim_out, 
-                                 LinearAttention(dim_out) if use_original else MultiHeadAttention(device, dim_out, 32*h, h, False, att_type, m, redraw_steps))),
+                Residual(PreNorm(dim_out,  LinearAttention(dim_out,
+                                                           heads = h,
+                                                           dim_head = head_sz) if use_original else MultiHeadAttention(device = device, 
+                                                                                                                       dim = dim_out, 
+                                                                                                                       d_model = head_sz*h,
+                                                                                                                       h = h, 
+                                                                                                                       bias = False, 
+                                                                                                                       att_type = att_type, 
+                                                                                                                       m = curr_m, 
+                                                                                                                       redraw_steps = redraw_steps))),
                 Upsample(dim_out, dim_in) if not is_last else  torch.nn.Conv2d(dim_out, dim_in, 3, padding = 1)
             ]))
-
+            curr_L *= 4
+            
         default_out_dim = channels
         self.out_dim = default_out_dim
 
-        self.final_res_block = block_klass(dim * 2, dim, time_emb_dim = self.time_dim)
-        self.final_conv = torch.nn.Conv2d(dim, self.out_dim, 1)
+        self.final_res_block = block_klass(init_dim * 2, init_dim, time_emb_dim = self.time_dim)
+        self.final_conv = torch.nn.Conv2d(init_dim, self.out_dim, 1)
 
     def forward(self, x, time):
         #input size = [batch_size, channels, dim, dim]

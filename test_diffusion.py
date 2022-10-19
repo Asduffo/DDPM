@@ -33,15 +33,15 @@ transform = Compose([
 mnist_tr_set = datasets.MNIST(root='./data', train=True,  download=True, transform=transform)
 mnist_ts_set = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
 
+
 d = Diffusion(batch_size          = 1,
               n_channels          = 1,
               x_sz                = 32,
-              y_sz                = 32,
               verbose             = 1,
               n_iters             = 10,
               data_slice_tr       = 10,
               data_slice_vl       = 5,
-              att_type            = 'FAVOR_RELU',
+              att_type            = 'FAVOR_SDP',
               resnet_block_groups = 8,
               m                   = None,
               use_original        = False)
