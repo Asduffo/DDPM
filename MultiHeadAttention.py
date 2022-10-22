@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
 
+"""
+This file defines the class MultiHeadAttention
+"""
+
 import torch
 
 from einops import rearrange
@@ -7,12 +11,14 @@ from einops import rearrange
 from Attention import *
 
 """
-The class which implements mullit head attention (not the attention mechanism itself!)
+The class which implements multi head attention (not the attention mechanism itself!).
+It is essentially a wrapper of the Attention mechanisms defined in Attention.py
+which performs the usual linear projections before performing the Attention itself.
 Parameters:
 
 device              = 'cuda',      #'cpu' for CPU training, 'cuda' for GPU training
 dim          : int  = 3,           #Input image's channels
-d_model      : int  = 128,         #Number of channels in the sample after applying conv2D (the output will still be of <dim> channels)
+d_model      : int  = 128,         #Number of channels in the sample after applying Conv2D (the output will still be of <dim> channels)
 h            : int  = 8,           #How many attention heads we want to use. d_model must be a multiple of it.
 bias         : bool = False,       #Whether the Conv2D should use bias
 att_type     : str  = 'FAVOR_SDP', #'SDP' for standard attention, else 'FAVOR_SDP' or 'FAVOR_RELU'
@@ -23,7 +29,7 @@ class MultiHeadAttention(torch.nn.Module):
     def __init__(self,
                  device              = 'cuda',      #'cpu' for CPU training, 'cuda' for GPU training
                  dim          : int  = 3,           #Input image's channels
-                 d_model      : int  = 128,         #Number of channels in the sample after applying conv2D (the output will still be of <dim> channels)
+                 d_model      : int  = 128,         #Number of channels in the sample after applying Conv2D (the output will still be of <dim> channels)
                  h            : int  = 8,           #How many attention heads we want to use. d_model must be a multiple of it.
                  bias         : bool = False,       #Whether the Conv2D should use bias
                  
@@ -46,7 +52,6 @@ class MultiHeadAttention(torch.nn.Module):
         assert(self.d_model % self.h == 0), "MultiHeadAttention: self.d_model % self.h != 0"
         self.head_sz = self.d_model // self.h #d_k/q/v in the paper
         
-        #the output size in theory is h*d_k (= d_model)
         #standard attention uses a simple linear layer, but the DDPM
         #uses a Conv2d instead (which makes sense since we're using images)
         self.W_q = torch.nn.Conv2d(dim, d_model, 1, bias = self.bias).to(self.device)
@@ -61,9 +66,9 @@ class MultiHeadAttention(torch.nn.Module):
             self.attention_module = SDPAttention(device = self.device, d_model = self.d_model, h = self.h)
         else: 
             if(self.att_type == 'FAVOR_SDP'):
-                print("using FAVOR+ with SDP")
+                print("Using FAVOR+ with a softmax Kernel")
             else:
-                print("using FAVOR+ with RELU")
+                print("Using FAVOR+ with a RELU Kernel")
             self.attention_module = FAVORplus(device = self.device, d_model = self.d_model, 
                                               h = self.h, kernel_type = self.att_type, 
                                               m = m, redraw_steps = redraw_steps)
