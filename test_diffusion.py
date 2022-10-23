@@ -26,6 +26,7 @@ transform = Compose([
     CenterCrop(image_size),
     ToTensor(), # turn into Numpy array of shape HWC, divide by 255
     Lambda(lambda t: (t * 2) - 1),
+    
 ])
 
 
@@ -42,7 +43,7 @@ d = Diffusion(batch_size          = 1,
               data_slice_vl       = 5,
               att_type            = 'FAVOR_SDP',
               resnet_block_groups = 8,
-              m                   = 1,
+              m                   = None,
               use_original        = False)
 d.to('cuda')
 d.fit(mnist_tr_set, mnist_ts_set)

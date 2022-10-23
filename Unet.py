@@ -1,14 +1,7 @@
 # -*- coding: utf-8 -*-
 
-"""
-Class containing the Unet code.
-It is an highly personalized version of lucidrain's Pytorch port of the original
-Tensorflow implementation by the authors of the DDPM paper.
 
-It supports both the original implementation's Linear Attention and my Performer
-implementation
-"""
-
+from inspect import isfunction
 from functools import partial
 from einops import rearrange
 from torch import einsum
@@ -37,8 +30,7 @@ def Upsample(dim, dim_out = None):
 def Downsample(dim, dim_out = None):
     return torch.nn.Conv2d(dim, default(dim_out, dim), 4, 2, 1)
 
-#block composing the resnet.
-#Conv2D -> group norm -> silu(x*(scale + 1) + shift)
+#block composing the resnet
 class Block(torch.nn.Module):
     def __init__(self, dim, dim_out, groups = 8):
         super().__init__()
@@ -75,7 +67,6 @@ class SinusoidalPosEmb(torch.nn.Module):
         return emb
 
 #a single resnet block.
-#block(x, time embedding with shift) -> block -> result + Conv2D(x)
 class ResnetBlock(torch.nn.Module):
     def __init__(self, dim, dim_out, *, time_emb_dim = None, groups = 8):
         super().__init__()
@@ -136,14 +127,14 @@ class Unet(torch.nn.Module):
     def __init__(
         self,
         x_sz,                               #x/y size of the image
-        init_dim     : int  = None,         #Initial Conv2D output dim. if not None, set to x_sz.
-        dim_mults           = (1, 2, 4, 8), #See <dims> initialization for further infos.
-        channels            = 3,            #Input image's channels
+        init_dim     : int  = None,         #if not 
+        dim_mults           = (1, 2, 4, 8), #see dims initialization for further infos.
+        channels            = 3,            #image original channels
         resnet_block_groups = 8,            #groups in the group norm
         time_dim            = 256,          #time embeddings dimensionality
         
-        h            : int  = 4,            #Number of attention heads
-        head_sz      : int  = 32,           #Dimension of an head
+        h            : int  = 4,            #attention heads
+        head_sz      : int  = 32,           #head size
         
         att_type     : str  = 'FAVOR_SDP',  #'SDP', 'FAVOR_SDP' or 'FAVOR_RELU'
         m            : int  = None,         #number of random orthogonal features in case of FAVOR+
@@ -154,33 +145,31 @@ class Unet(torch.nn.Module):
     ):
         super().__init__()
 
+        # determine dimensions
         self.channels = channels
         
         #number of channels obtained by the first convolution
         input_channels = channels
 
-        #default initialization of init_dim
         if(init_dim is None):
             init_dim = x_sz
             
-        #total number of pixels (currently we only support square images)
         L = x_sz*x_sz
         
         if(m is None):
             m = head_sz*math.ceil(math.log(head_sz))
         
-        #initial convolution. Returns a 3D tensor with <init_dim> channels
+        #initial convolution. Returns a convolution with <init_dim> channels
         self.init_conv = torch.nn.Conv2d(input_channels, init_dim, 7, padding = 3)
 
         #if(for example) dim_mults = (1, 2, 4, 8), init_dim = 32
-        #then dims = [32, 32, 64, 128, 256] = [init_dim, init_dim*1, init_dim*2, init_dim*4, init_dim*8]
+        #then dims = [20, 32, 64, 128, 256] = [20, x_sz*1, x_sz*2, x_sz*4, x_sz*8]
         dims = [init_dim, *map(lambda m: init_dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
-        #using a partial makes the code cleaner
         block_klass = partial(ResnetBlock, groups = resnet_block_groups)
 
-        # time embeddings. The embeddings in the original implementation have a size
+        # time embeddings. The embeddings in the original paper have a size
         #equal to 4*dim. Here it's customizable.
         self.time_dim = time_dim
         
@@ -203,9 +192,9 @@ class Unet(torch.nn.Module):
         )
 
         # layers
-        self.downs = torch.nn.ModuleList([]) #compressor
-        self.ups = torch.nn.ModuleList([])   #decompressor
-        num_resolutions = len(in_out)        #number of layers (== len(dim_mults))
+        self.downs = torch.nn.ModuleList([])  #compressor
+        self.ups = torch.nn.ModuleList([])    #decompressor
+        num_resolutions = len(in_out)   #number of layers
 
         curr_L = L
         #creates <num_resolutions> layers for the compressor
@@ -213,8 +202,6 @@ class Unet(torch.nn.Module):
             #checks if it's the last layer
             is_last = ind == (num_resolutions - 1)
             
-            #if L < m, sets m = L (otherwise its cost is higher than the standard
-            #attention mechanism).
             curr_m = m
             if(m > curr_L and not use_original):
                 curr_m = int(curr_L)
@@ -236,11 +223,10 @@ class Unet(torch.nn.Module):
                                                                                                                      att_type = att_type, 
                                                                                                                      m = curr_m, 
                                                                                                                      redraw_steps = redraw_steps))),
-                                                                                
+                                                                                                                     
                 Downsample(dim_in, dim_out) if not is_last else torch.nn.Conv2d(dim_in, dim_out, 3, padding = 1)
             ]))
             
-            #sequence length for the next layer
             curr_L /= 4
         
         curr_L *= 4
@@ -260,7 +246,6 @@ class Unet(torch.nn.Module):
         #Attention(mid_dim)
         self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = self.time_dim)
 
-        #decompressor
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             #is this the bottomest layer? (happens at the last iteration)
             is_last = ind == (num_resolutions - 1)
@@ -304,14 +289,14 @@ class Unet(torch.nn.Module):
         
         #used in the upper-most layer of the decompressor for concatenation
         r = x.clone()
-        
+
         #size: [batch_size, time_dim]
         t = self.time_mlp(time)
 
         #saves the residuals of the compressor. They will be concatenated
         #in the decompressor's inputs
         h = []
-        
+
         #iterates in the compressor (top-bottom)
         for block1, block2, attn, downsample in self.downs:
             x = block1(x, t)
@@ -334,7 +319,7 @@ class Unet(torch.nn.Module):
         for block1, block2, attn, upsample in self.ups:
             #concatenates the input with the decompressor's output
             #from the same "level" in the Unet (in this case it's the
-            #output of the attention block).
+            #output of the FIRST block).
             x = torch.cat((x, h.pop()), dim = 1)
             
             #first block
@@ -342,7 +327,7 @@ class Unet(torch.nn.Module):
 
             #concatenates the input with the decompressor's output
             #from the same "level" in the Unet (in this case it's the
-            #output of the first block).
+            #output of the SECOND block).
             x = torch.cat((x, h.pop()), dim = 1)
             x = block2(x, t)
             
@@ -357,7 +342,6 @@ class Unet(torch.nn.Module):
         x = self.final_res_block(x, t)
         return self.final_conv(x)
     
-#the original attention mechanism implemented in the original Pytorch port of the DDPM
 class Attention(torch.nn.Module):
     def __init__(self, dim, heads=4, dim_head=32):
         super().__init__()
@@ -383,7 +367,6 @@ class Attention(torch.nn.Module):
         out = rearrange(out, "b h (x y) d -> b (h d) x y", x=h, y=w)
         return self.to_out(out)
 
-#the Linear attention mechanism implemented in the original Pytorch port of the DDPM
 class LinearAttention(torch.nn.Module):
     def __init__(self, dim, heads=4, dim_head=32):
         super().__init__()

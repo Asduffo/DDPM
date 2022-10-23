@@ -1,8 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-This file defines the Diffusion class itelf, which can be trained to learn to sample
-images from the distribution given from the dataset
-"""
+
 
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -23,7 +20,7 @@ class OptimizerData():
         self.kwargs         = kwargs
         
 """
-A wrapper for the optimizer's scheduler. Useful if we want to instantiate it at the __init__() call
+A wrapper for the optimizer. Useful if we want to instantiate it at the __init__() call
 """
 class SchedulerData():
     def __init__(self,
@@ -36,8 +33,8 @@ class SchedulerData():
 Class defining a diffusion model. Contains everything needed for performing sampling.
 
 Parameters:
-n_channels    : int   = 1,           Input image channels
-x_sz          : int   = 28,          Horizontal pixels (at the moment the class only supports square images so it's also the number of columns)
+n_channels    : int   = 1,           input image channels
+x_sz          : int   = 28,          horizontal pixels (at the moment the class only supports square images so it's also the number of columns)
 att_type      : str   = 'FAVOR_SDP', 'SDP', 'FAVOR_SDP' or 'FAVOR_RELU'
 m             : int   = None,        Number of random orthogonal features to use. None = head_sz*log(head_sz) 
 redraw_steps  : int   = 1000,        Number of steps before redrawing the random orthogonal features
@@ -47,16 +44,16 @@ head_sz       : int   = 32,          Attention head size
  
 sample_iters  : int   = 1000,        T in the paper
 
-t_size        : int   = 256,         Dimensionality of the time embeddings (before passing it through a linear layer)
+t_size        : int   = 256,         Dimensionality of the time embeddings (before passing through a linear layer)
 device                = 'cuda',      'cpu' for CPU training, 'cuda' for GPU training
 b_1           : float = 10e-4,       $\beta_1$ in the DDPM paper
 b_T           : float = 0.02,        $\beta_T$ in the DDPM paper
 
 opt_data      : OptimizerData = OptimizerData(torch.optim.Adam, lr = 1e-4),                        The optimizer
-sched_data    : SchedulerData = SchedulerData(torch.optim.lr_scheduler.ExponentialLR, gamma = 1),  The optimizer's scheduler
+sched_data    : SchedulerData = SchedulerData(torch.optim.lr_scheduler.ExponentialLR, gamma = 1),  The optimizer's schedules
 loss          : torch.nn      = torch.nn.MSELoss(), #The loss function
 batch_size    : int   = 1,
-data_slice_tr : int   = 0,           if > 0, use only the first data_slice_tr samples in the training   set
+data_slice_tr : int   = 0,           if > 0, use only the first data_slice_tr samples in the training set
 data_slice_vl : int   = 0,           if > 0, use only the first data_slice_vl samples in the validation set
 n_iters       : int   = 10,          Number of training epochs
 
@@ -69,8 +66,8 @@ clipnorm     : float  = 10000.0      Gradient clip norm. Not particularly import
 """
 class Diffusion(torch.nn.Module):
     def __init__(self,
-                 n_channels    : int   = 1,        #Input image channels
-                 x_sz          : int   = 28,       #Horizontal pixels (at the moment the class only supports square images so it's also the number of columns)
+                 n_channels    : int   = 1,        #input image channels
+                 x_sz          : int   = 28,       #horizontal pixels (at the moment the class only supports square images so it's also the number of columns)
                  att_type      : str   = 'FAVOR_SDP', #'SDP', 'FAVOR_SDP' or 'FAVOR_RELU'
                  m             : int   = None,     #Number of random orthogonal features to use. None = head_sz*log(head_sz) 
                  redraw_steps  : int   = 1000,     #Number of steps before redrawing the random orthogonal features
@@ -86,16 +83,16 @@ class Diffusion(torch.nn.Module):
                  b_T           : float = 0.02,     #$\beta_T$ in the DDPM paper
                  
                  opt_data      : OptimizerData = OptimizerData(torch.optim.Adam, lr = 1e-4),                        #The optimizer
-                 sched_data    : SchedulerData = SchedulerData(torch.optim.lr_scheduler.ExponentialLR, gamma = 1),  #The optimizer's scheduler
+                 sched_data    : SchedulerData = SchedulerData(torch.optim.lr_scheduler.ExponentialLR, gamma = 1),  #The optimizer's schedules
                  loss          : torch.nn      = torch.nn.MSELoss(), #The loss function
                  batch_size    : int   = 1,
-                 data_slice_tr : int   = 0,       #if > 0, use only the first data_slice_tr samples in the training   set
-                 data_slice_vl : int   = 0,       #if > 0, use only the first data_slice_vl samples in the validation set
+                 data_slice_tr : int   = 0,       #if >0, use only the first data_slice samples in the training/vl set
+                 data_slice_vl : int   = 0,       #
                  n_iters       : int   = 10,      #Number of training epochs
                  
                  verbose       : int   = 1,       #If 0, no logs will be printed with the exception of the progress bar
                  
-                 dim_mults             = (1, 2, 4), #used by the unet (refer to Unet.py for further infos)
+                 dim_mults             = (1, 2, 4), #used by the unet
                  resnet_block_groups   = 8,
                  use_original : bool   = False,   #If true, uses the original attention code as used in the paper
                  clipnorm     : float  = 10000.0  #Gradient clip norm. Not particularly important.
@@ -192,7 +189,7 @@ class Diffusion(torch.nn.Module):
             #calculates the noise
             predicted = self.net(x_T, torch.Tensor([t]).to(self.device)).detach()
             
-            #Calculates x_{t-1}
+            #removes the noise
             x_T = (x_T - model_weight*predicted)/alpha_sqrt + z*self.sigma[t]
             
             #displays the image if asked
@@ -316,6 +313,8 @@ class Diffusion(torch.nn.Module):
                 self.eval()
                 enumerator = tqdm(data_loader_vl)
                 for i, data in enumerate(enumerator):
+                    
+                    
                     #we don't really care about the labels
                     images, _ = data
                     
@@ -384,7 +383,7 @@ class Diffusion(torch.nn.Module):
     def debug_sample(self,
                      x : torch.utils.data.Dataset,
                      index          = 0,
-                     sampling_time  = 200,
+                     sampling_time  = 1,
                      verbose_module = 100):
         transform = transforms.ToPILImage()
         
@@ -397,6 +396,7 @@ class Diffusion(torch.nn.Module):
         data_loader = torch.utils.data.DataLoader(dataset = trainset_1, 
                                                   batch_size = self.batch_size,
                                                   shuffle = True)
+        
         
         for i, data in enumerate(data_loader, 0):
             #we don't really care about the labels
@@ -422,7 +422,7 @@ class Diffusion(torch.nn.Module):
             #alphas and sqrt(1 - alpha)
             sqrt_a         = torch.zeros((1, 1, 1, 1)).to(self.device)
             sqrt_1_minus_a = torch.zeros((1, 1, 1, 1)).to(self.device)
-            
+    
             sqrt_a[0, 0, 0, 0]         = self.a_sgn_sqrt[curr_t[0].item()]
             sqrt_1_minus_a[0, 0, 0, 0] = self.one_m_a_sgn_sqrt[curr_t[0].item()]
             

@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
 
-"""
-This file implements the various attention mechanisms tested
-(except for linear attention which is inside the Unet.py file)
-"""
-
 ###############################################################################
 #FOR THE RECORDS: L = total number of pixels in the image (rows*columns)
 ###############################################################################
@@ -15,14 +10,14 @@ import numpy as np
 import einops
 
 """
-An abstract class for the attention mechanism. It only contains some sanity checks
+An abstract class for the attention mechanism it only contains some sanity checks
 for the head size
 """
 class Attention(torch.nn.Module):
     def __init__(self,
                  device        = 'cuda',
-                 d_model : int = 128,   #h*(head_sz).
-                 h       : int = 4,     #Number of Attention heads
+                 d_model : int = 128,   #h*(heads dimention).
+                 h       : int = 4,     #number of heads
                  ):
         super(Attention, self).__init__()
         
@@ -35,7 +30,7 @@ class Attention(torch.nn.Module):
         self.head_sz = self.d_model // self.h
     
     """
-    Quick reminder that here Q, K and V have already been through a Conv2d
+    Quick reminder that here Q, K and V have already been through a conv2d
     They have size [b, h, L, head_sz = d_k] where L = total number of pixels in the image
     """
     def forward(self, Q, K, V, mask = None):
@@ -90,22 +85,22 @@ Performer's code (also known as FAVOR+)
 
 Parameters:
 device                 = 'cuda',       'cpu' for CPU training, 'cuda' for GPU training
-d_model        : int   = 512,          h*head_sz
+d_model        : int   = 512,
 h              : int   = 4,            How many attention heads we want to use. d_model must be a multiple of it.
-kernel_type    : str   = 'FAVOR_SDP',  FAVOR_SDP (softmax kernel) or FAVOR_RELU
+kernel_type    : str   = 'FAVOR_SDP',  FAVOR_SDP or FAVOR_RELU
 num_stabilizer : float = .0001,        The numerical stability constant
 redraw_steps   : int   = 1000,         Number of steps before redrawing the random orthogonal features 
-m              : int   = None,         Number of random ortohogonal features. If none, it defaults to head_sz*log(head_sz)
+m              : int   = None,         Number of random ortohogonal features
 """
 class FAVORplus(Attention):
     def __init__(self,
-                 device                 = 'cuda',       #'cpu' for CPU training, 'cuda' for GPU training
-                 d_model        : int   = 512,          #h*head_sz
+                 device                 = 'cuda',
+                 d_model        : int   = 512,
                  h              : int   = 4,            #How many attention heads we want to use. d_model must be a multiple of it.
-                 kernel_type    : str   = 'FAVOR_SDP',  #FAVOR_SDP (softmax kernel) or FAVOR_RELU supported
+                 kernel_type    : str   = 'FAVOR_SDP',  #FAVOR_SDP or FAVOR_RELU supported
                  num_stabilizer : float = .0001,        #The numerical stability constant
                  redraw_steps   : int   = 1000,         #Number of steps before redrawing the random orthogonal features
-                 m              : int   = None,         #Number of random ortohogonal features. If none, it defaults to head_sz*log(head_sz)
+                 m              : int   = None,         #Number of random ortohogonal features
                  ):
         super(FAVORplus, self).__init__(device,
                                         d_model,
@@ -119,23 +114,24 @@ class FAVORplus(Attention):
         self.redraw_steps   = redraw_steps
         
         #sets m to the default value if None
-        if(m is None): 
+        if(m is not None): 
+            self.m = m
+        else:
             #m = d*log(d) is the optimal m size in terms of kernel approx.
             self.m = self.head_sz*math.ceil(math.log(self.head_sz))
-        else:
-            self.m = m
+            print(math.log(self.head_sz))
+            print(self.m)
         
         #Constants useful in the softmax_kernel
         self.sq_d    = torch.sqrt(torch.tensor([self.head_sz], dtype=torch.float32)).to(self.device)
         self.sq_sq_d = torch.sqrt(self.sq_d).to(self.device)
         self.sq_m    = torch.sqrt(torch.tensor([self.m], dtype=torch.float32)).to(self.device)
         
-        #creates the projection matrix made of random orthogonal features
         self.projection_matrix = self.redraw_proj_matrix()
         self.n_calls = 0
         
     #returns a [m, head_sz] matrix where the rows of each sub-blocks of
-    #size <head_sz> are orthogonal between each other.
+    #size <head_size> are orthogonal between each other.
     def redraw_proj_matrix(self):
         n_subblocks = int(self.m / self.head_sz)
         
@@ -181,12 +177,12 @@ class FAVORplus(Attention):
         arr = x/self.sq_sq_d
         
         #altough projection_matrix^T has size [head_sz, m] and arr is 
-        #[b, h, L, head_sz], the multiplication automatically duplicates the
+        #[b, L, h, head_sz], the multiplication automatically duplicates the
         #projection matrix into 2 new axis before proceeding.
-        arr = arr @ self.projection_matrix.permute((1, 0)) #size: [b, h, L, m]
+        arr = arr @ self.projection_matrix.permute((1, 0)) #size: [b,L,h,m]
         
         #(||x||^2)/(2*sqrt(head_sz))
-        #final size: [b, h, L, 1]
+        #final size: [b, L, h, 1]
         g = x**2
         g = torch.sum(g, dim = -1, keepdim = True)
         g = g/(2*self.sq_d)
@@ -207,7 +203,7 @@ class FAVORplus(Attention):
         #altough projection_matrix^T has size [head_sz, m] and arr is 
         #[b, h, L, head_sz], the multiplication automatically duplicates the
         #projection matrix into 2 new axis before proceeding.
-        arr = x @ self.projection_matrix.permute((1, 0)) #size: [b, h, L, m]
+        arr = x @ self.projection_matrix.permute((1, 0)) #size: [b,h,Lm]
         arr = arr/self.sq_m
         arr = torch.nn.functional.relu(arr) + torch.tensor([self.num_stabilizer]).to(self.device)
         
@@ -231,8 +227,7 @@ class FAVORplus(Attention):
             phi_k = self.softmax_kernel(k)
         
         
-        #"official implementation". Left here only for benchmarks. 
-        #My own implementation seems faster :D
+        #"official implementation". Left here only for benchmarks. My implementation seems faster :D
         """
         phi_k_sum = phi_k.sum(dim = -2)
         D         = torch.einsum('...nd,...d->...n', phi_q, phi_k_sum.type_as(phi_q))
